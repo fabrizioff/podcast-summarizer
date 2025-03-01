@@ -7,9 +7,7 @@ services:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY}
+    network_mode: host
     volumes:
       - ./:/app
     restart: unless-stopped
-
-volumes:
-  bot_cache:
