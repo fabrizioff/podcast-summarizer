@@ -12,6 +12,12 @@ from datetime import datetime, timedelta
 import json
 from typing import Dict, Optional
 import tempfile
+import logging
+import sys
+import time
+from discord.errors import ConnectionClosed, GatewayNotFound, HTTPException
+from aiohttp import web
+import threading
 
 # Load environment variables
 load_dotenv()
@@ -39,6 +45,16 @@ cache: Dict[str, dict] = {}
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger('bot')
 
 class ProcessStatus:
     def __init__(self, ctx, with_audio=False):
@@ -204,18 +220,25 @@ async def get_transcript(video_id: str, status: ProcessStatus) -> Optional[str]:
     """Get transcript from YouTube video"""
     try:
         await rate_limiter.acquire()
+
+        proxy = {
+            'http': 'http://127.0.0.1:8080',
+            'https': 'http://127.0.0.1:8080'
+        }
         
         try:
             transcript_list = await asyncio.to_thread(
                 YouTubeTranscriptApi.get_transcript, 
                 video_id,
-                languages=['en']
+                languages=['en'],
+                proxies=proxy
             )
         except:
             transcript_list = await asyncio.to_thread(
                 YouTubeTranscriptApi.get_transcript, 
                 video_id,
-                languages=['en-US', 'en-GB', 'en']
+                languages=['en-US', 'en-GB', 'en'],
+                proxies=proxy
             )
         
         processed_texts = []
@@ -793,176 +816,6 @@ async def podcast_topics(ctx):
         await ctx.send(f"Podcast topics created: https://docs.google.com/document/d/{doc_id}/view?usp=sharing")
         
     except Exception as e:
-        await ctx.send(f"Error generating topics: {str(e)}")@bot.command(name='podcast_topics')
-async def podcast_topics(ctx):
-    """
-    Command to generate concise podcast topics from cached summaries
-    Usage: !podcast_topics
-    """
-    try:
-        if not summary_cache.cache:
-            await ctx.send("No podcast summaries found in cache!")
-            return
-            
-        # Process cached summaries for key topics and events
-        topics = []
-        
-        for video_id, styles in summary_cache.cache.items():
-            for summary in styles.values():
-                # Extract topics and their content
-                topic_matches = re.finditer(r'On ([^:]+):(.*?)(?=(?:On [^:]+:|$))', summary, re.DOTALL)
-                
-                for match in topic_matches:
-                    topic = match.group(1).strip()
-                    content = match.group(2).strip()
-                    
-                    # Look for key metrics, numbers, and events
-                    numbers = re.findall(r'\$?\d+(?:,\d+)*(?:\.\d+)?(?:k|m|b|M|B|K)?%?', content)
-                    has_metrics = len(numbers) > 0
-                    
-                    # Look for price movements or market events
-                    has_market_event = any(word in content.lower() for word in 
-                        ['price', 'crash', 'dump', 'pump', 'surge', 'drop', 'fall', 'rise', 
-                         'liquidation', 'market', 'trading'])
-                    
-                    # Look for significant developments
-                    has_development = any(word in content.lower() for word in 
-                        ['announce', 'launch', 'release', 'update', 'change', 'proposal', 
-                         'regulation', 'policy'])
-                    
-                    # If content is significant, add to topics
-                    if has_metrics or has_market_event or has_development:
-                        # Extract key details and format concisely
-                        paragraphs = content.split('\n\n')
-                        key_details = []
-                        
-                        for para in paragraphs:
-                            # Extract specific numbers, dates, and events
-                            details = para.strip()
-                            if details:
-                                key_details.append(details)
-                        
-                        # Create concise topic summary
-                        if key_details:
-                            topic_summary = {
-                                'title': topic,
-                                'content': ' '.join(key_details)
-                            }
-                            topics.append(topic_summary)
-        
-        # Sort topics by relevance (presence of numbers/metrics first)
-        topics.sort(key=lambda x: len(re.findall(r'\$?\d+', x['content'])), reverse=True)
-        
-        # Generate formatted content
-        doc_content = "Topics for Podcast\n\n"
-        
-        for topic in topics:
-            # Format topic and content like the example
-            content = topic['content']
-            
-            # Format lists with asterisks if found
-            list_items = re.findall(r'(?:^|\n)[-•] (.+?)(?=\n|$)', content)
-            if list_items:
-                content = re.sub(r'(?:^|\n)[-•] (.+?)(?=\n|$)', r'\n* \1', content)
-            
-            # Add topic summary
-            doc_content += f"{topic['title']}: {content}\n\n"
-        
-        # Create Google Doc
-        credentials = service_account.Credentials.from_service_account_file(
-            GOOGLE_CREDENTIALS_FILE,
-            scopes=['https://www.googleapis.com/auth/documents', 'https://www.googleapis.com/auth/drive.file']
-        )
-        
-        docs_service = build('docs', 'v1', credentials=credentials)
-        drive_service = build('drive', 'v3', credentials=credentials)
-        
-        document = {
-            'title': f"Podcast Topics - {datetime.now().strftime('%Y-%m-%d')}"
-        }
-        
-        doc = await asyncio.to_thread(
-            docs_service.documents().create(body=document).execute
-        )
-        doc_id = doc.get('documentId')
-        
-        requests = [
-            {
-                'insertText': {
-                    'location': {'index': 1},
-                    'text': doc_content
-                }
-            },
-            {
-                'updateTextStyle': {
-                    'range': {
-                        'startIndex': 1,
-                        'endIndex': len(doc_content) + 1
-                    },
-                    'textStyle': {
-                        'fontSize': {'magnitude': 11, 'unit': 'PT'},
-                        'weightedFontFamily': {'fontFamily': 'Nunito'}
-                    },
-                    'fields': 'fontSize,weightedFontFamily'
-                }
-            }
-        ]
-        
-        # Bold the main title
-        title_end = doc_content.find('\n')
-        if title_end != -1:
-            requests.append({
-                'updateTextStyle': {
-                    'range': {
-                        'startIndex': 1,
-                        'endIndex': title_end + 1
-                    },
-                    'textStyle': {
-                        'bold': True,
-                        'fontSize': {'magnitude': 14, 'unit': 'PT'}
-                    },
-                    'fields': 'bold,fontSize'
-                }
-            })
-        
-        # Bold topic titles
-        for match in re.finditer(r'^[^:]+:', doc_content, re.MULTILINE):
-            requests.append({
-                'updateTextStyle': {
-                    'range': {
-                        'startIndex': match.start() + 1,
-                        'endIndex': match.end() + 1
-                    },
-                    'textStyle': {'bold': True},
-                    'fields': 'bold'
-                }
-            })
-        
-        await asyncio.to_thread(
-            docs_service.documents().batchUpdate(
-                documentId=doc_id,
-                body={'requests': requests}
-            ).execute
-        )
-        
-        # Set permissions
-        permission = {
-            'type': 'anyone',
-            'role': 'reader',
-            'allowFileDiscovery': False
-        }
-        
-        await asyncio.to_thread(
-            drive_service.permissions().create(
-                fileId=doc_id,
-                body=permission,
-                supportsAllDrives=True
-            ).execute
-        )
-        
-        await ctx.send(f"Podcast topics created: https://docs.google.com/document/d/{doc_id}/view?usp=sharing")
-        
-    except Exception as e:
         await ctx.send(f"Error generating topics: {str(e)}")
 
 @bot.command(name='commands')
@@ -984,5 +837,70 @@ Podcast Insights Bot Commands
 """
     await ctx.send(f"```\n{commands_text}\n```")
 
-# Run the bot
-bot.run(DISCORD_TOKEN)
+# Add this function before your bot.run() call
+async def start_bot():
+    retry_count = 0
+    max_retries = 10
+    base_delay = 5  # Start with 5 seconds delay
+    
+    while True:
+        try:
+            logger.info("Attempting to connect to Discord...")
+            await bot.start(DISCORD_TOKEN)
+        except (ConnectionClosed, GatewayNotFound, HTTPException, 
+                aiohttp.ClientConnectorError, aiohttp.ClientConnectorDNSError) as e:
+            if retry_count >= max_retries:
+                logger.error(f"Failed to connect after {max_retries} retries. Exiting.")
+                break
+                
+            retry_count += 1
+            delay = base_delay * (2 ** min(retry_count, 6))  # Exponential backoff capped at 320 seconds
+            logger.error(f"Connection error: {str(e)}. Retrying in {delay} seconds... (Attempt {retry_count}/{max_retries})")
+            await asyncio.sleep(delay)
+        except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}")
+            break
+
+async def health_check(request):
+    return web.Response(text="OK")
+
+def run_health_server():
+    # Try different ports if the primary one is in use
+    ports_to_try = [8080, 8081, 8082, 8083]
+    
+    for port in ports_to_try:
+        try:
+            app = web.Application()
+            app.add_routes([web.get('/health', health_check)])
+            
+            # Create a new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            print(f"Starting health server on port {port}")
+            loop.run_until_complete(
+                web._run_app(app, host='0.0.0.0', port=port, print=None, handle_signals=False)
+            )
+            break  # If we get here, the server started successfully
+        except OSError as e:
+            if "address already in use" in str(e).lower():
+                print(f"Port {port} is already in use, trying next port...")
+                continue
+            else:
+                print(f"Health server error: {str(e)}")
+                break
+        except Exception as e:
+            print(f"Health server error: {str(e)}")
+            break
+
+# Define the health server
+health_thread = threading.Thread(target=run_health_server, daemon=True)
+health_thread.start()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(start_bot())
+    except KeyboardInterrupt:
+        logger.info("Bot shutdown by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
