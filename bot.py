@@ -41,6 +41,43 @@ request_timestamps = []
 CACHE_FILE = 'summary_cache.json'
 cache: Dict[str, dict] = {}
 
+# Add this with the other constants at the top of the file, after the imports
+prompt_actionable = """
+-----------------------------------
+YT VIDEO -> ACTIONABLE PLAN
+-----------------------------------
+
+You are now an Implementation Extractor. Your only job is to analyze this YouTube transcript and extract PURELY ACTIONABLE steps, completely ignoring all theory, background information, stories, or fluff.
+
+Follow these exact rules:
+
+- Only include specific, concrete actions that someone can execute immediately
+- Format each step as a numbered item starting with an action verb
+- Include specific numbers, measurements, or timeframes when mentioned
+- Remove all explanations of "why" - focus only on "what" and "how"
+- If any step is vague, either make it specific or remove it
+- Maximum of 10 steps - prioritize the most immediately practical & actionable items
+- Focus on steps that can be implemented today
+
+Format your response as:
+
+EXECUTION STEPS:
+- Action step 1
+- Action step 2
+- etc.
+
+KEY METRICS (if any mentioned):
+- Metric 1: [Value]
+- Metric 2: [Value]
+
+REQUIRED TOOLS/RESOURCES:
+- Tool/Resource 1
+- Tool/Resource 2
+
+Here's the transcript to analyze:
+------------------------------
+"""
+
 # Discord bot setup
 intents = discord.Intents.default()
 intents.message_content = True
@@ -265,12 +302,16 @@ async def get_transcript(video_id: str, status: ProcessStatus) -> Optional[str]:
         else:
             raise Exception(f"Error getting transcript: {str(e)}")
 
-async def summarize_text(text: str, status: ProcessStatus) -> Optional[str]:
+async def summarize_text(text: str, status: ProcessStatus, style: str = 'default') -> Optional[str]:
     """Summarize text using DeepSeek R1 via OpenRouter"""
     try:
         await rate_limiter.acquire()
 
-        prompt = """
+        # Choose prompt based on style
+        if style == 'actionable':
+            prompt = prompt_actionable
+        else:  # default
+            prompt = """
 Please analyze this transcript and create a detailed summary in exactly this format. What we are preparing is Podcast Insights, I will be using this only for podcasts:
 
 Key Takeaways:
@@ -326,7 +367,7 @@ Here's the transcript to analyze:
                     raise Exception("Invalid response structure from DeepSeek R1")
 
                 summary = result["choices"][0]["message"]["content"].strip()
-                formatted_summary = process_summary_format(summary)
+                formatted_summary = process_summary_format(summary, style)
                 
         await status.update_step('summary')
         return formatted_summary
@@ -335,8 +376,13 @@ Here's the transcript to analyze:
         await status.update_step('summary', '❌')
         raise Exception(f"Error in summarization: {e}")
 
-def process_summary_format(summary: str) -> str:
+def process_summary_format(summary: str, style: str = 'default') -> str:
     """Process the summary to ensure consistent formatting"""
+    if style == 'actionable':
+        # Don't process actionable summaries, return as-is
+        return summary
+        
+    # Process default style summaries
     sections = re.split(r'\n(?=Key Takeaways:|On [^:]+:)', summary)
     
     formatted_sections = []
@@ -522,11 +568,17 @@ async def clear_cache(ctx, video_url: str = None):
         await ctx.send(f"Error clearing cache: {str(e)}")
 
 @bot.command(name='summarize')
-async def summarize(ctx, url: str):
+async def summarize(ctx, url: str, style: str = 'default'):
     """
     Command to summarize YouTube video (Google Doc only)
-    Usage: !summarize <youtube_url>
+    Usage: !summarize <youtube_url> [style]
+    Styles: default, actionable
     """
+    # Validate style parameter
+    if style not in ['default', 'actionable']:
+        await ctx.send("Invalid style. Available styles: default, actionable")
+        return
+        
     status = ProcessStatus(ctx, with_audio=False)
     await status.create_status_message()
     
@@ -536,13 +588,13 @@ async def summarize(ctx, url: str):
         if not video_id:
             raise ValueError("Invalid YouTube URL")
         
-        # Check cache
-        cached_summary = summary_cache.get(video_id, 'default')
+        # Check cache with style
+        cached_summary = summary_cache.get(video_id, style)
         if cached_summary:
             await status.update_step('transcript')
             await status.update_step('summary')
-            doc_url = await create_google_doc(cached_summary, f"Summary - {url}", status)
-            await ctx.send(f"Summary created: {doc_url}")
+            doc_url = await create_google_doc(cached_summary, f"Summary - {url} ({style})", status)
+            await ctx.send(f"{style.capitalize()} summary created: {doc_url}")
             return
         
         # Get transcript
@@ -550,30 +602,36 @@ async def summarize(ctx, url: str):
         if not transcript:
             raise Exception("Couldn't get transcript for this video")
         
-        # Get summary
-        summary = await summarize_text(transcript, status)
+        # Get summary with specified style
+        summary = await summarize_text(transcript, status, style)
         if not summary:
             raise Exception("Error generating summary")
         
-        # Cache the summary
-        summary_cache.set(video_id, 'default', summary)
+        # Cache the summary with style
+        summary_cache.set(video_id, style, summary)
         
         # Create Google Doc
-        doc_url = await create_google_doc(summary, f"Summary - {url}", status)
+        doc_url = await create_google_doc(summary, f"Summary - {url} ({style})", status)
         if not doc_url:
             raise Exception("Error creating Google Doc")
         
-        await ctx.send(f"Summary created: {doc_url}")
+        await ctx.send(f"{style.capitalize()} summary created: {doc_url}")
         
     except Exception as e:
         await ctx.send(f"Error: {str(e)}")
 
 @bot.command(name='summarize_audio')
-async def summarize_audio(ctx, url: str):
+async def summarize_audio(ctx, url: str, style: str = 'default'):
     """
     Command to summarize YouTube video and create audio
-    Usage: !summarize_audio <youtube_url>
+    Usage: !summarize_audio <youtube_url> [style]
+    Styles: default, actionable
     """
+    # Validate style parameter
+    if style not in ['default', 'actionable']:
+        await ctx.send("Invalid style. Available styles: default, actionable")
+        return
+        
     status = ProcessStatus(ctx, with_audio=True)
     await status.create_status_message()
     
@@ -583,12 +641,12 @@ async def summarize_audio(ctx, url: str):
         if not video_id:
             raise ValueError("Invalid YouTube URL")
         
-        # Check cache
-        cached_summary = summary_cache.get(video_id, 'default')
+        # Check cache with style
+        cached_summary = summary_cache.get(video_id, style)
         if cached_summary:
             await status.update_step('transcript')
             await status.update_step('summary')
-            doc_url = await create_google_doc(cached_summary, f"Summary - {url}", status)
+            doc_url = await create_google_doc(cached_summary, f"Summary - {url} ({style})", status)
             
             # Generate audio from cached summary
             audio_data = await text_to_speech(cached_summary, status)
@@ -600,7 +658,7 @@ async def summarize_audio(ctx, url: str):
             
             # Send both summary link and audio file
             await ctx.send(
-                f"Summary created: {doc_url}",
+                f"{style.capitalize()} summary created: {doc_url}",
                 file=discord.File(temp_file_path, filename="summary.mp3")
             )
             
@@ -613,16 +671,16 @@ async def summarize_audio(ctx, url: str):
         if not transcript:
             raise Exception("Couldn't get transcript for this video")
         
-        # Get summary
-        summary = await summarize_text(transcript, status)
+        # Get summary with specified style
+        summary = await summarize_text(transcript, status, style)
         if not summary:
             raise Exception("Error generating summary")
         
-        # Cache the summary
-        summary_cache.set(video_id, 'default', summary)
+        # Cache the summary with style
+        summary_cache.set(video_id, style, summary)
         
         # Create Google Doc
-        doc_url = await create_google_doc(summary, f"Summary - {url}", status)
+        doc_url = await create_google_doc(summary, f"Summary - {url} ({style})", status)
         if not doc_url:
             raise Exception("Error creating Google Doc")
         
@@ -636,7 +694,7 @@ async def summarize_audio(ctx, url: str):
         
         # Send both summary link and audio file
         await ctx.send(
-            f"Summary created: {doc_url}",
+            f"{style.capitalize()} summary created: {doc_url}",
             file=discord.File(temp_file_path, filename="summary.mp3")
         )
         
@@ -827,10 +885,14 @@ async def show_commands(ctx):
     commands_text = """
 Podcast Insights Bot Commands
 
-- !summarize <youtube_url>: Creates a detailed summary (Google Doc only)
-  Example: !summarize https://youtube.com/watch?v=12345
-- !summarize_audio <youtube_url>: Creates both summary and audio version
-  Example: !summarize_audio https://youtube.com/watch?v=12345
+- !summarize <youtube_url> [style]: Creates a detailed summary (Google Doc only)
+  Example: !summarize https://youtube.com/watch?v=12345 actionable
+  Available styles: default, actionable
+  
+- !summarize_audio <youtube_url> [style]: Creates both summary and audio version
+  Example: !summarize_audio https://youtube.com/watch?v=12345 actionable
+  Available styles: default, actionable
+  
 - !podcast_topics: Generates an overview of all podcast topics in cache
 - !clearcache: Clears the entire summary cache
 - !clearcache <youtube_url>: Clears cache for specific video
