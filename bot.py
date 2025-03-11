@@ -10,7 +10,7 @@ from googleapiclient.discovery import build
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import json
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple, Callable, Any
 import tempfile
 import logging
 import sys
@@ -18,6 +18,7 @@ import time
 from discord.errors import ConnectionClosed, GatewayNotFound, HTTPException
 from aiohttp import web
 import threading
+from enum import Enum
 
 # Load environment variables
 load_dotenv()
@@ -39,7 +40,6 @@ request_timestamps = []
 
 # Cache configuration
 CACHE_FILE = 'summary_cache.json'
-cache: Dict[str, dict] = {}
 
 # Add this with the other constants at the top of the file, after the imports
 prompt_actionable = """
@@ -167,9 +167,172 @@ class SummaryCache:
         self.cache[key][style] = summary
         self.save_cache()
 
+# Define a prompt registry system
+class PromptType(Enum):
+    DEFAULT = "default"
+    ACTIONABLE = "actionable"
+    THREAD_STANDARD = "thread_standard"
+    THREAD_ACTIONABLE = "thread_actionable"
+
+# Add these prompts to your constants section
+PROMPTS = {
+    PromptType.DEFAULT: """
+Please analyze this transcript and create a detailed summary in exactly this format. What we are preparing is Podcast Insights, I will be using this only for podcasts:
+
+Key Takeaways:
+[List 6-7 main points, each with a bullet point (•) followed by bold title and explanation]
+• Title: Detailed explanation of the key point...
+• Title: Detailed explanation of the key point...
+
+Then provide in-depth breakdowns of key topics, each with its own section:
+
+On [Topic]:
+[Detailed analysis and breakdown, with proper paragraphing. Minimum 2-3 paragraphs per section.]
+
+Follow these exact guidelines:
+1. Start directly with "Key Takeaways: " without any introduction
+2. Make each key takeaway substantive and detailed
+3. Include multiple topic sections with "On [Topic]: " headers
+4. Maintain minimal spacing between sections
+5. Keep paragraph structure but avoid excessive line breaks
+6. ***DO NOT USE MARKDOWN FORMATTING (INCLUDING ** FOR BOLD)*** - bold styling is applied programmatically
+7. I REPEAT ***DO NOT USE MARKDOWN FORMATTING (INCLUDING ** FOR BOLD)*** - bold styling is applied programmatically
+
+The output should have the below writing style and not use words like highlight, emphasize or any hype terms.
+
+Here's the transcript to analyze:
+""",
+
+    PromptType.ACTIONABLE: prompt_actionable,  
+
+    PromptType.THREAD_STANDARD: """
+
+Create a Twitter/X thread from this content. The thread should be educational, informative, and engaging.
+
+Format requirements:
+1. Start with a hook tweet that grabs attention
+2. Each tweet should be under 280 characters
+3. Number each tweet (e.g., "1/🧵", "2/", etc.)
+4. End with a call to action
+5. Total thread length: 8-12 tweets
+6. Make complex ideas simple and actionable
+7. Use short paragraphs and simple language
+
+Here's the content to transform into a thread:
+""",
+
+    PromptType.THREAD_ACTIONABLE: """
+You are an implementation extractor. Your job is to help provide others with alpha by analyzing the provided YouTube transcript and extracting purely actionable steps that someone can implement immediately. Ignore all theory, background information, stories, or fluff.
+Create a thread for X (formerly Twitter) with the following structure:
+The first tweet must contain a strong hook that captures the main theme of the transcript in an attention-grabbing way.
+
+Following tweets must each contain one actionable step, numbered sequentially (e.g., "1. Action step here...").
+
+Each tweet must be 240 characters or less.
+
+Follow these exact rules:
+Only include specific, concrete actions that someone can execute immediately.
+
+Format each step as numbered thread items, not exceeding the 240 character limit per tweet.
+
+Include specific numbers, measurements, or timeframes when mentioned in the transcript.
+
+Remove all explanations of "why" - focus only on "what" and "how".
+
+If any step is vague, either make it specific or remove it.
+
+Include a maximum of 10 steps - prioritize the most immediately practical and actionable items.
+
+Focus on steps that can be implemented today.
+
+Your output will deliver concise, practical insights to others, so ensure every step is clear and actionable.
+
+Here's the content to transform into a thread:
+"""
+}
+
+# Define formatters for each prompt type
+def format_default(summary: str) -> str:
+    sections = re.split(r'\n(?=Key Takeaways:|On [^:]+:)', summary)
+    
+    formatted_sections = []
+    for section in sections:
+        section = section.strip()
+        if section:
+            if section.startswith('Key Takeaways:'):
+                formatted_sections.append(section)
+            elif section.startswith('On '):
+                title, content = section.split(':', 1)
+                formatted_sections.append(f"{title}:{content.strip()}")
+    
+    return "\n\n".join(formatted_sections)
+
+def format_actionable(summary: str) -> str:
+    # Return as-is
+    return summary
+
+def format_thread(summary: str) -> str:
+    # Format thread output - just basic cleanup
+    return summary.strip()
+
+# Map prompt types to their formatters
+FORMATTERS = {
+    PromptType.DEFAULT: format_default,
+    PromptType.ACTIONABLE: format_actionable,
+    PromptType.THREAD_STANDARD: format_thread,
+    PromptType.THREAD_ACTIONABLE: format_thread,
+}
+
+# Add the EnhancedSummaryCache class here, after PromptType is defined
+class EnhancedSummaryCache:
+    def __init__(self, cache_file: str):
+        self.cache_file = cache_file
+        self.cache = self.load_cache()
+        
+    def load_cache(self) -> dict:
+        """Load cache from file"""
+        try:
+            with open(self.cache_file, 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {"transcripts": {}, "summaries": {}}
+            
+    def save_cache(self):
+        """Save cache to file"""
+        with open(self.cache_file, 'w') as f:
+            json.dump(self.cache, f)
+            
+    def get_transcript(self, video_id: str) -> Optional[str]:
+        """Get cached transcript"""
+        if "transcripts" in self.cache and video_id in self.cache["transcripts"]:
+            return self.cache["transcripts"][video_id]
+        return None
+        
+    def set_transcript(self, video_id: str, transcript: str):
+        """Cache new transcript"""
+        if "transcripts" not in self.cache:
+            self.cache["transcripts"] = {}
+        self.cache["transcripts"][video_id] = transcript
+        self.save_cache()
+        
+    def get_summary(self, video_id: str, prompt_type: PromptType) -> Optional[str]:
+        """Get cached summary"""
+        if "summaries" in self.cache and video_id in self.cache["summaries"] and prompt_type.value in self.cache["summaries"][video_id]:
+            return self.cache["summaries"][video_id][prompt_type.value]
+        return None
+        
+    def set_summary(self, video_id: str, prompt_type: PromptType, summary: str):
+        """Cache new summary"""
+        if "summaries" not in self.cache:
+            self.cache["summaries"] = {}
+        if video_id not in self.cache["summaries"]:
+            self.cache["summaries"][video_id] = {}
+        self.cache["summaries"][video_id][prompt_type.value] = summary
+        self.save_cache()
+
 # Initialize rate limiter and cache
 rate_limiter = RateLimiter(MAX_REQUESTS_PER_MINUTE, REQUEST_WINDOW)
-summary_cache = SummaryCache(CACHE_FILE)
+summary_cache = EnhancedSummaryCache(CACHE_FILE)
 
 def chunk_text(text: str, max_chunk_size: int = 2500) -> list:
     """Split text into chunks for TTS processing"""
@@ -302,42 +465,14 @@ async def get_transcript(video_id: str, status: ProcessStatus) -> Optional[str]:
         else:
             raise Exception(f"Error getting transcript: {str(e)}")
 
-async def summarize_text(text: str, status: ProcessStatus, style: str = 'default') -> Optional[str]:
+# Replace the summarize_text function with this more generalized version
+async def summarize_text(text: str, status: ProcessStatus, prompt_type: PromptType = PromptType.DEFAULT) -> Optional[str]:
     """Summarize text using DeepSeek R1 via OpenRouter"""
     try:
         await rate_limiter.acquire()
 
-        # Choose prompt based on style
-        if style == 'actionable':
-            prompt = prompt_actionable
-        else:  # default
-            prompt = """
-Please analyze this transcript and create a detailed summary in exactly this format. What we are preparing is Podcast Insights, I will be using this only for podcasts:
-
-Key Takeaways:
-[List 6-7 main points, each with a bullet point (•) followed by bold title and explanation]
-• Title: Detailed explanation of the key point...
-• Title: Detailed explanation of the key point...
-
-Then provide in-depth breakdowns of key topics, each with its own section:
-
-On [Topic]:
-[Detailed analysis and breakdown, with proper paragraphing. Minimum 2-3 paragraphs per section.]
-
-Follow these exact guidelines:
-1. Start directly with "Key Takeaways: " without any introduction
-2. Make each key takeaway substantive and detailed
-3. Include multiple topic sections with "On [Topic]: " headers
-4. Maintain minimal spacing between sections
-5. Keep paragraph structure but avoid excessive line breaks
-6. ***DO NOT USE MARKDOWN FORMATTING (INCLUDING ** FOR BOLD)*** - bold styling is applied programmatically
-7. I REPEAT ***DO NOT USE MARKDOWN FORMATTING (INCLUDING ** FOR BOLD)*** - bold styling is applied programmatically
-
-The output should have the below writing style and not use words like highlight, emphasize or any hype terms.
-
-Here's the transcript to analyze:
-"""
-        
+        # Get the prompt from the registry
+        prompt = PROMPTS.get(prompt_type, PROMPTS[PromptType.DEFAULT])
         prompt = f"{prompt} {text}"
         
         async with aiohttp.ClientSession() as session:
@@ -367,7 +502,10 @@ Here's the transcript to analyze:
                     raise Exception("Invalid response structure from DeepSeek R1")
 
                 summary = result["choices"][0]["message"]["content"].strip()
-                formatted_summary = process_summary_format(summary, style)
+                
+                # Get the appropriate formatter
+                formatter = FORMATTERS.get(prompt_type, format_default)
+                formatted_summary = formatter(summary)
                 
         await status.update_step('summary')
         return formatted_summary
@@ -375,27 +513,6 @@ Here's the transcript to analyze:
     except Exception as e:
         await status.update_step('summary', '❌')
         raise Exception(f"Error in summarization: {e}")
-
-def process_summary_format(summary: str, style: str = 'default') -> str:
-    """Process the summary to ensure consistent formatting"""
-    if style == 'actionable':
-        # Don't process actionable summaries, return as-is
-        return summary
-        
-    # Process default style summaries
-    sections = re.split(r'\n(?=Key Takeaways:|On [^:]+:)', summary)
-    
-    formatted_sections = []
-    for section in sections:
-        section = section.strip()
-        if section:
-            if section.startswith('Key Takeaways:'):
-                formatted_sections.append(section)
-            elif section.startswith('On '):
-                title, content = section.split(':', 1)
-                formatted_sections.append(f"{title}:{content.strip()}")
-    
-    return "\n\n".join(formatted_sections)
 
 async def create_google_doc(summary: str, title: str, status: ProcessStatus) -> Optional[str]:
     """Create a Google Doc with the summary"""
@@ -568,15 +685,17 @@ async def clear_cache(ctx, video_url: str = None):
         await ctx.send(f"Error clearing cache: {str(e)}")
 
 @bot.command(name='summarize')
-async def summarize(ctx, url: str, style: str = 'default'):
+async def summarize(ctx, url: str, prompt_type: str = 'default'):
     """
     Command to summarize YouTube video (Google Doc only)
-    Usage: !summarize <youtube_url> [style]
-    Styles: default, actionable
+    Usage: !summarize <youtube_url> [prompt_type]
+    Types: default, actionable, thread_standard, thread_actionable
     """
-    # Validate style parameter
-    if style not in ['default', 'actionable']:
-        await ctx.send("Invalid style. Available styles: default, actionable")
+    # Validate prompt type
+    try:
+        prompt_enum = PromptType(prompt_type)
+    except ValueError:
+        await ctx.send(f"Invalid prompt type. Available types: {', '.join([t.value for t in PromptType])}")
         return
         
     status = ProcessStatus(ctx, with_audio=False)
@@ -588,48 +707,56 @@ async def summarize(ctx, url: str, style: str = 'default'):
         if not video_id:
             raise ValueError("Invalid YouTube URL")
         
-        # Check cache with style
-        cached_summary = summary_cache.get(video_id, style)
-        if cached_summary:
+        # Check cache for transcript first
+        transcript = summary_cache.get_transcript(video_id)
+        if not transcript:
+            # Get transcript if not cached
+            transcript = await get_transcript(video_id, status)
+            if not transcript:
+                raise Exception("Couldn't get transcript for this video")
+            # Cache the transcript
+            summary_cache.set_transcript(video_id, transcript)
+        else:
             await status.update_step('transcript')
+        
+        # Check cache for summary with this prompt type
+        cached_summary = summary_cache.get_summary(video_id, prompt_enum)
+        if cached_summary:
             await status.update_step('summary')
-            doc_url = await create_google_doc(cached_summary, f"Summary - {url} ({style})", status)
-            await ctx.send(f"{style.capitalize()} summary created: {doc_url}")
+            doc_url = await create_google_doc(cached_summary, f"Summary - {url} ({prompt_enum.value})", status)
+            await ctx.send(f"{prompt_enum.value.capitalize()} summary created: {doc_url}")
             return
         
-        # Get transcript
-        transcript = await get_transcript(video_id, status)
-        if not transcript:
-            raise Exception("Couldn't get transcript for this video")
-        
-        # Get summary with specified style
-        summary = await summarize_text(transcript, status, style)
+        # Get summary with specified prompt type
+        summary = await summarize_text(transcript, status, prompt_enum)
         if not summary:
             raise Exception("Error generating summary")
         
-        # Cache the summary with style
-        summary_cache.set(video_id, style, summary)
+        # Cache the summary with prompt type
+        summary_cache.set_summary(video_id, prompt_enum, summary)
         
         # Create Google Doc
-        doc_url = await create_google_doc(summary, f"Summary - {url} ({style})", status)
+        doc_url = await create_google_doc(summary, f"Summary - {url} ({prompt_enum.value})", status)
         if not doc_url:
             raise Exception("Error creating Google Doc")
         
-        await ctx.send(f"{style.capitalize()} summary created: {doc_url}")
+        await ctx.send(f"{prompt_enum.value.capitalize()} summary created: {doc_url}")
         
     except Exception as e:
         await ctx.send(f"Error: {str(e)}")
 
 @bot.command(name='summarize_audio')
-async def summarize_audio(ctx, url: str, style: str = 'default'):
+async def summarize_audio(ctx, url: str, prompt_type: str = 'default'):
     """
     Command to summarize YouTube video and create audio
-    Usage: !summarize_audio <youtube_url> [style]
-    Styles: default, actionable
+    Usage: !summarize_audio <youtube_url> [prompt_type]
+    Types: default, actionable, thread_standard, thread_actionable
     """
-    # Validate style parameter
-    if style not in ['default', 'actionable']:
-        await ctx.send("Invalid style. Available styles: default, actionable")
+    # Validate prompt type
+    try:
+        prompt_enum = PromptType(prompt_type)
+    except ValueError:
+        await ctx.send(f"Invalid prompt type. Available types: {', '.join([t.value for t in PromptType])}")
         return
         
     status = ProcessStatus(ctx, with_audio=True)
@@ -641,12 +768,23 @@ async def summarize_audio(ctx, url: str, style: str = 'default'):
         if not video_id:
             raise ValueError("Invalid YouTube URL")
         
-        # Check cache with style
-        cached_summary = summary_cache.get(video_id, style)
-        if cached_summary:
+        # Check cache for transcript first
+        transcript = summary_cache.get_transcript(video_id)
+        if not transcript:
+            # Get transcript if not cached
+            transcript = await get_transcript(video_id, status)
+            if not transcript:
+                raise Exception("Couldn't get transcript for this video")
+            # Cache the transcript
+            summary_cache.set_transcript(video_id, transcript)
+        else:
             await status.update_step('transcript')
+        
+        # Check cache for summary with this prompt type
+        cached_summary = summary_cache.get_summary(video_id, prompt_enum)
+        if cached_summary:
             await status.update_step('summary')
-            doc_url = await create_google_doc(cached_summary, f"Summary - {url} ({style})", status)
+            doc_url = await create_google_doc(cached_summary, f"Summary - {url} ({prompt_enum.value})", status)
             
             # Generate audio from cached summary
             audio_data = await text_to_speech(cached_summary, status)
@@ -658,7 +796,7 @@ async def summarize_audio(ctx, url: str, style: str = 'default'):
             
             # Send both summary link and audio file
             await ctx.send(
-                f"{style.capitalize()} summary created: {doc_url}",
+                f"{prompt_enum.value.capitalize()} summary created: {doc_url}",
                 file=discord.File(temp_file_path, filename="summary.mp3")
             )
             
@@ -666,21 +804,16 @@ async def summarize_audio(ctx, url: str, style: str = 'default'):
             os.unlink(temp_file_path)
             return
         
-        # Get transcript
-        transcript = await get_transcript(video_id, status)
-        if not transcript:
-            raise Exception("Couldn't get transcript for this video")
-        
-        # Get summary with specified style
-        summary = await summarize_text(transcript, status, style)
+        # Get summary with specified prompt type
+        summary = await summarize_text(transcript, status, prompt_enum)
         if not summary:
             raise Exception("Error generating summary")
         
-        # Cache the summary with style
-        summary_cache.set(video_id, style, summary)
+        # Cache the summary with prompt type
+        summary_cache.set_summary(video_id, prompt_enum, summary)
         
         # Create Google Doc
-        doc_url = await create_google_doc(summary, f"Summary - {url} ({style})", status)
+        doc_url = await create_google_doc(summary, f"Summary - {url} ({prompt_enum.value})", status)
         if not doc_url:
             raise Exception("Error creating Google Doc")
         
@@ -694,7 +827,7 @@ async def summarize_audio(ctx, url: str, style: str = 'default'):
         
         # Send both summary link and audio file
         await ctx.send(
-            f"{style.capitalize()} summary created: {doc_url}",
+            f"{prompt_enum.value.capitalize()} summary created: {doc_url}",
             file=discord.File(temp_file_path, filename="summary.mp3")
         )
         
@@ -885,19 +1018,158 @@ async def show_commands(ctx):
     commands_text = """
 Podcast Insights Bot Commands
 
-- !summarize <youtube_url> [style]: Creates a detailed summary (Google Doc only)
+- !summarize <youtube_url> [prompt_type]: Creates a detailed summary (Google Doc only)
   Example: !summarize https://youtube.com/watch?v=12345 actionable
-  Available styles: default, actionable
+  Available types: default, actionable, thread_standard, thread_actionable
   
-- !summarize_audio <youtube_url> [style]: Creates both summary and audio version
-  Example: !summarize_audio https://youtube.com/watch?v=12345 actionable
-  Available styles: default, actionable
+- !summarize_audio <youtube_url> [prompt_type]: Creates both summary and audio version
+  Example: !summarize_audio https://youtube.com/watch?v=12345 thread_standard
+  Available types: default, actionable, thread_standard, thread_actionable
+  
+- !thread <youtube_url> [prompt_type] [target]: Creates Twitter/X threads
+  Example: !thread https://youtube.com/watch?v=12345 thread_actionable all
+  Prompt types: thread_standard, thread_actionable
+  Target options: transcript (default), summary, all
   
 - !podcast_topics: Generates an overview of all podcast topics in cache
 - !clearcache: Clears the entire summary cache
 - !clearcache <youtube_url>: Clears cache for specific video
 """
     await ctx.send(f"```\n{commands_text}\n```")
+
+# Add a new command for generating threads with more flexibility
+@bot.command(name='thread')
+async def generate_thread(ctx, url: str, prompt_type: str = 'thread_standard', target: str = 'transcript'):
+    """
+    Command to generate Twitter/X threads from YouTube content
+    Usage: !thread <youtube_url> [prompt_type] [target]
+    
+    Prompt types: thread_standard, thread_actionable
+    Target options:
+    - transcript: Generate thread from video transcript (default)
+    - summary: Generate thread from default summary
+    - all: Generate both transcript-based and summary-based threads in one document
+    """
+    # Validate prompt type
+    valid_prompt_types = [PromptType.THREAD_STANDARD.value, PromptType.THREAD_ACTIONABLE.value]
+    if prompt_type not in valid_prompt_types:
+        await ctx.send(f"Invalid prompt type. Available thread types: {', '.join(valid_prompt_types)}")
+        return
+        
+    # Validate target
+    valid_targets = ['transcript', 'summary', 'all']
+    if target not in valid_targets:
+        await ctx.send(f"Invalid target. Available targets: {', '.join(valid_targets)}")
+        return
+    
+    try:
+        prompt_enum = PromptType(prompt_type)
+        
+        # Create status message
+        status = ProcessStatus(ctx, with_audio=False)
+        await status.create_status_message()
+        
+        # Extract video ID
+        video_id = await extract_video_id(url)
+        if not video_id:
+            raise ValueError("Invalid YouTube URL")
+        
+        # Get transcript
+        transcript = summary_cache.get_transcript(video_id)
+        if not transcript:
+            transcript = await get_transcript(video_id, status)
+            if not transcript:
+                raise Exception("Couldn't get transcript for this video")
+            summary_cache.set_transcript(video_id, transcript)
+        else:
+            await status.update_step('transcript')
+        
+        # Initialize variables for content
+        transcript_thread = None
+        summary_thread = None
+        combined_content = ""
+        
+        # Process based on target
+        if target in ['transcript', 'all']:
+            # Generate thread from transcript
+            transcript_thread_key = f"{prompt_type}_from_transcript"
+            cached_thread = summary_cache.get_summary(video_id, PromptType(transcript_thread_key)) if hasattr(PromptType, transcript_thread_key) else None
+            
+            if not cached_thread:
+                transcript_thread = await summarize_text(transcript, status, prompt_enum)
+                if not transcript_thread:
+                    raise Exception("Error generating transcript-based thread")
+                
+                # Create a custom key for caching
+                if not hasattr(PromptType, transcript_thread_key):
+                    # Dynamically add the enum value
+                    PromptType._value2member_map_[transcript_thread_key] = prompt_enum
+                
+                summary_cache.set_summary(video_id, PromptType(transcript_thread_key), transcript_thread)
+            else:
+                transcript_thread = cached_thread
+        
+        if target in ['summary', 'all']:
+            # First ensure we have a default summary
+            default_summary = summary_cache.get_summary(video_id, PromptType.DEFAULT)
+            if not default_summary:
+                default_summary = await summarize_text(transcript, status, PromptType.DEFAULT)
+                if not default_summary:
+                    raise Exception("Error generating default summary")
+                summary_cache.set_summary(video_id, PromptType.DEFAULT, default_summary)
+            
+            # Generate thread from summary
+            summary_thread_key = f"{prompt_type}_from_summary"
+            cached_thread = summary_cache.get_summary(video_id, PromptType(summary_thread_key)) if hasattr(PromptType, summary_thread_key) else None
+            
+            if not cached_thread:
+                summary_thread = await summarize_text(default_summary, status, prompt_enum)
+                if not summary_thread:
+                    raise Exception("Error generating summary-based thread")
+                
+                # Create a custom key for caching
+                if not hasattr(PromptType, summary_thread_key):
+                    # Dynamically add the enum value
+                    PromptType._value2member_map_[summary_thread_key] = prompt_enum
+                
+                summary_cache.set_summary(video_id, PromptType(summary_thread_key), summary_thread)
+            else:
+                summary_thread = cached_thread
+        
+        # Create appropriate Google Doc(s) based on target
+        if target == 'all':
+            # Combine both threads into one document
+            combined_content = "# TRANSCRIPT-BASED THREAD\n\n"
+            combined_content += transcript_thread
+            combined_content += "\n\n# SUMMARY-BASED THREAD\n\n"
+            combined_content += summary_thread
+            
+            # Create a single Google Doc with both threads
+            doc_url = await create_google_doc(
+                combined_content, 
+                f"Combined Threads - {url} ({prompt_type})", 
+                status
+            )
+            await ctx.send(f"Combined {prompt_type} threads created: {doc_url}")
+        else:
+            # Create a single Google Doc for the selected target
+            if target == 'transcript':
+                doc_url = await create_google_doc(
+                    transcript_thread, 
+                    f"Thread from Transcript - {url} ({prompt_type})", 
+                    status
+                )
+                await ctx.send(f"Transcript-based {prompt_type} thread: {doc_url}")
+            else:  # target == 'summary'
+                doc_url = await create_google_doc(
+                    summary_thread, 
+                    f"Thread from Summary - {url} ({prompt_type})", 
+                    status
+                )
+                await ctx.send(f"Summary-based {prompt_type} thread: {doc_url}")
+        
+    except Exception as e:
+        await ctx.send(f"Error generating thread: {str(e)}")
 
 # Add this function before your bot.run() call
 async def start_bot():
